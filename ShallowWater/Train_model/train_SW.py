@@ -15,6 +15,13 @@ from tqdm import trange
 import itertools
 import argparse
 
+def get_freer_gpu():
+    os.system('nvidia-smi -q -d Memory |grep Free >tmp')
+    memory_available = [int(x.split()[2]) for x in open('tmp', 'r').readlines()]
+    return str(np.argmax(memory_available))
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 def output_construction(Ux,t_his, cx, cy, P=1000, ds=3, Nx=32, Ny=32, Nt=100):
     U_all = np.zeros((P,ds))
     Y_all = np.zeros((P,ds))
@@ -186,14 +193,14 @@ def main(n, decoder):
     Ny = 32
     Nt = 5
 
-    d = np.load("../Data/SW/train_SW.npz")
+    d = np.load("../Data/train_SW.npz")
     u_train = d["u_train"]
     S_train = d["S_train"]
     T  = d["T"]
     CX = d["CX"]
     CY = d["CY"]
 
-    d = np.load("../Data/SW/test_SW.npz")
+    d = np.load("../Data/test_SW.npz")
     u_test = d["u_test"]
     S_test = d["S_test"]
     T  = d["T"]

@@ -17,6 +17,12 @@ from tqdm import trange
 import itertools
 import argparse
 
+# def get_freer_gpu():
+#     os.system('nvidia-smi -q -d Memory |grep Free >tmp')
+#     memory_available = [int(x.split()[2]) for x in open('tmp', 'r').readlines()]
+#     return str(np.argmax(memory_available))
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE']="False"
 
 class DataGenerator(data.Dataset):
@@ -50,7 +56,7 @@ class DataGenerator(data.Dataset):
 # Geneate training data corresponding to one input sample
 def generate_one_datum(freq, m=500, P=500):
     X = jnp.linspace(0,1, num=m)
-    u = 2*jnp.pi*freq*jnp.cos(2*jnp.pi*freq*X)
+    u = jnp.cos(2*jnp.pi*freq*X)
     u_fn = lambda x, t: jnp.interp(t, X.flatten(), u)
     u = vmap(u_fn, in_axes=(None,0))(0.0, X)
     y_train = jnp.linspace(0, 1, P)
@@ -64,19 +70,51 @@ def generate_data(freqs, N, m):
   return u_train, y_train, s_train
 
 class operator_model:
-    def __init__(self,branch_layers, trunk_layers , m=100, P=100,n=None, decoder=None, ds=None):    
+    def __init__(self,branch_layers, trunk_layers, NN_layers = None, m=100, P=100,n=None, decoder=None, ds=None):
 
+        # Branch net
         seed = np.random.randint(low=0, high=100000)
         self.branch_init, self.branch_apply = self.init_NN(branch_layers, activation=Gelu)
         self.in_shape = (-1, branch_layers[0])
         self.out_shape, branch_params = self.branch_init(random.PRNGKey(seed), self.in_shape)
 
-        seed = np.random.randint(low=0, high=100000)
-        self.trunk_init, self.trunk_apply = self.init_NN(trunk_layers, activation=Gelu)
-        self.in_shape = (-1, trunk_layers[0])
-        self.out_shape, trunk_params = self.trunk_init(random.PRNGKey(seed), self.in_shape)
+        if decoder=="nonlinear":
+            self.fwd = self.NOMAD
+            # Trunk net
+            seed = np.random.randint(low=0, high=100000)
+            self.trunk_init, self.trunk_apply = self.init_NN(trunk_layers, activation=Gelu)
+            self.in_shape = (-1, trunk_layers[0])
+            self.out_shape, trunk_params = self.trunk_init(random.PRNGKey(seed), self.in_shape)
 
-        params = (trunk_params, branch_params)
+            params = (trunk_params, branch_params)
+
+        if decoder=="linear":
+            self.fwd = self.DeepONet
+            # Trunk net
+            seed = np.random.randint(low=0, high=100000)
+            self.trunk_init, self.trunk_apply = self.init_NN_final_act(trunk_layers, activation=Gelu)
+            self.in_shape = (-1, trunk_layers[0])
+            self.out_shape, trunk_params = self.trunk_init(random.PRNGKey(seed), self.in_shape)
+
+            params = (trunk_params, branch_params)
+
+        if decoder=="nonlinear_v2":
+            self.fwd = self.NOMAD_v2
+
+            # Trunk net
+            seed = np.random.randint(low=0, high=100000)
+            self.trunk_init, self.trunk_apply = self.init_NN_final_act(trunk_layers, activation=Gelu)
+            self.in_shape = (-1, trunk_layers[0])
+            self.out_shape, trunk_params = self.trunk_init(random.PRNGKey(seed), self.in_shape)
+            
+            # final NN
+            seed = np.random.randint(low=0, high=100000)
+            self.NN_init, self.NN_apply = self.init_NN(NN_layers, activation=Gelu)
+            self.in_shape = (-1, NN_layers[0])
+            self.out_shape, NN_params = self.NN_init(random.PRNGKey(seed), self.in_shape)
+
+            params = (trunk_params, branch_params, NN_params)
+
         # Use optimizers to set optimizer initialization and update functions
         self.opt_init,self.opt_update,self.get_params = optimizers.adam(optimizers.exponential_decay(1e-3, 
                                                                       decay_steps=100, 
@@ -86,14 +124,11 @@ class operator_model:
         self.itercount = itertools.count()
         self.loss_log = []
 
-        if decoder=="nonlinear":
-            self.fwd = self.NOMAD
-        if decoder=="linear":
-            self.fwd = self.DeepONet
 
         self.n  = n
         self.ds = ds
-
+        self.m = m
+        self.P = P
 
     def init_NN(self, Q, activation=Gelu):
         layers = []
@@ -108,24 +143,76 @@ class operator_model:
             net_init, net_apply = stax.serial(*layers)
         return net_init, net_apply
 
+    def init_NN_final_act(self, Q, activation=Gelu):
+        layers = []
+        num_layers = len(Q)
+        if num_layers < 2:
+            net_init, net_apply = stax.serial()
+        else:
+            for i in range(0, num_layers-2):
+                layers.append(Dense(Q[i+1]))
+                layers.append(activation)
+            layers.append(Dense(Q[-1]))
+            layers.append(stax.Tanh)
+            net_init, net_apply = stax.serial(*layers)
+        return net_init, net_apply
+
     @partial(jax.jit, static_argnums=0)
     def NOMAD(self, params, inputs):
         trunk_params, branch_params = params
         inputsu, inputsy = inputs
+        # print('inputsu',inputsu.shape) # (100, 500, 1)
+        # print('inputsy',inputsy.shape) # (100, 500, 1)
+        # print('inputsu reshaped', inputsu.reshape(inputsu.shape[0], 1, inputsu.shape[1]).shape) # (100, 1, 500)
         b = self.branch_apply(branch_params, inputsu.reshape(inputsu.shape[0], 1, inputsu.shape[1])) 
+        # print('b',b.shape) # (100, 1, latent_dim)
         b = jnp.tile(b, (1,inputsy.shape[1],1))
+        # print(b[:, 0, :] - b[:, 42, :]) # all zeros
+        # print('reshaped b',b.shape) # (100, 500, latent_dim)
+        # tmp = jnp.tile(inputsy,(1,1,b.shape[-1]//inputsy.shape[-1]))
+        # print('reshaped inputsy',tmp.shape) # (100, 500, latent_dim)
+        # print(tmp[0, : , 0] - tmp[42, :, 42]) # all zeros
         inputs_recon = jnp.concatenate((jnp.tile(inputsy,(1,1,b.shape[-1]//inputsy.shape[-1])), b), axis=-1)
+        # print('inputs_recon',inputs_recon.shape) # (100, 500, 2*latent_dim)
         out = self.trunk_apply(trunk_params, inputs_recon)
+        # print('out',out.shape) # (100, 500, 1)
+        return out
+
+    @partial(jax.jit, static_argnums=0)
+    def NOMAD_v2(self, params, inputs):
+        trunk_params, branch_params, NN_params = params
+        inputsxu, inputsy = inputs # (100, 500, 1), (100, 500, 1)
+        
+        # Branch net
+        inputsxu = inputsxu.reshape(inputsxu.shape[0], 1, inputsxu.shape[1]*inputsxu.shape[2]) # (100, 1, 500)
+        b = self.branch_apply(branch_params, inputsxu) # (100, 1, latent_dim)
+        b = jnp.tile(b, (1, self.m, 1)) # (100, 500, latent_dim)
+
+        # Trunk net
+        t = self.trunk_apply(trunk_params, inputsy) # (100, 500, latent_dim)
+        
+        # non-linear decoder
+        NN_input = jnp.concatenate((t, b), axis=-1) # (100, 500, 2*latent_dim)
+        out = self.NN_apply(NN_params, NN_input) 
+
         return out
 
     @partial(jax.jit, static_argnums=0)
     def DeepONet(self, params, inputs):
         trunk_params, branch_params = params
         inputsxu, inputsy = inputs
+        # print('inputsxu',inputsxu.shape) # (100, 500, 1)
+        # print('inputsy',inputsy.shape) # (100, 500, 1)
+        # print('inputsxu reshaped', inputsxu.reshape(inputsxu.shape[0],1,inputsxu.shape[1]*inputsxu.shape[2]).shape) # (100, 1, 500)
         t = self.trunk_apply(trunk_params, inputsy).reshape(inputsy.shape[0], inputsy.shape[1], self.ds, self.n)
+        # print('t', self.trunk_apply(trunk_params, inputsy).shape) # (100, 500, latent_dim)
+        # print('reshaped t',t.shape) # (100, 500, 1, latent_dim)
         b = self.branch_apply(branch_params, inputsxu.reshape(inputsxu.shape[0],1,inputsxu.shape[1]*inputsxu.shape[2]))
+        # print('b',b.shape) # (100, 1, latent_dim)
         b = b.reshape(b.shape[0],int(b.shape[2]/self.ds),self.ds)
+        # print('reshaped b',b.shape) # (100, latent_dim, 1)
         Guy = jnp.einsum("ijkl,ilk->ijk", t,b)
+        # print('Guy',Guy.shape) # (100, 500, 1)
         return Guy
         
     @partial(jax.jit, static_argnums=0)
@@ -221,7 +308,6 @@ def main(n, decoder):
     y_test = jnp.reshape(y_test,(num_test,P,dy))
     s_test = jnp.reshape(s_test,(num_test,P,ds))
 
-
     train_dataset = DataGenerator(U_train, y_train, s_train, training_batch_size)
     train_dataset = iter(train_dataset)
     test_dataset = DataGenerator(U_test, y_test, s_test, training_batch_size)
@@ -230,11 +316,17 @@ def main(n, decoder):
     if decoder=="nonlinear":
         branch_layers = [m,   100, 100, 100, 100, 100, ds*n]
         trunk_layers  = [ds*n*2, 100, 100, 100, 100, 100, ds]
+        NN_layers = None
+    if decoder=="nonlinear_v2":
+        branch_layers = [m,   100, 100, 100, 100, 100, ds*n]
+        trunk_layers  = [dy,  100, 100, 100, 100, 100, ds*n]
+        NN_layers = [2*ds*n, 100, 100, 100, 100, 100, 1]
     elif decoder=="linear":
         branch_layers = [m,   100, 100, 100, 100, 100, ds*n]
         trunk_layers  = [dy,  100, 100, 100, 100, 100, ds*n]
+        NN_layers = None
 
-    model = operator_model(branch_layers, trunk_layers, m=m, P=P,n=n, decoder=decoder, ds=ds)
+    model = operator_model(branch_layers, trunk_layers, NN_layers=NN_layers, m=m, P=P,n=n, decoder=decoder, ds=ds)
     model.count_params()
 
     start_time = timeit.default_timer()
@@ -262,7 +354,7 @@ def main(n, decoder):
     train_error_u = []
     for i in range(0,num_test):
         train_error_u.append(norm(s_train[i,:,0]- s_pred_train[i,:,0],2)/norm(s_train[i,:,0],2))
-    print("The average train u error is %e"%(np.mean(train_error_u)))
+    print("The average train u error is %e the standard deviation is %e the min error is %e and the max error is %e"%(np.mean(train_error_u),np.std(train_error_u),np.min(train_error_u),np.max(train_error_u)))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process model parameters.')

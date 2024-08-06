@@ -32,10 +32,10 @@ for i in range(len(n_hat)):
     n = n_hat[i]
     for j in range(len(iterations)):
         it = iterations[j]
-        d = np.load("../Error_Vectors/Error_Antiderivative_DeepONet_nhat%d_iteration%d_linear.npz"%(n,it))
+        d = np.load("Error_Vectors/Error_Antiderivative_DeepONet_nhat%d_iteration%d_linear.npz"%(n,it))
         test_error_DON_linear[i,j]   = np.mean(d["test_error"])
 
-        d = np.load("../Error_Vectors/Error_Antiderivative_DeepONet_nhat%d_iteration%d_nonlinear.npz"%(n,it))
+        d = np.load("Error_Vectors/Error_Antiderivative_DeepONet_nhat%d_iteration%d_nonlinear.npz"%(n,it))
         test_error_DON_nonlinear[i,j]   = np.mean(d["test_error"])
 
 DON_linear    = np.tile(np.array(["Linear Decoder"])[None,:],(1000,1))
